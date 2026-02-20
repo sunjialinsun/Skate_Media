@@ -6,15 +6,16 @@ English
 
 ### Overview
 
-Skating Pose is an Android demo app built on **Google AI Edge / MediaPipe Tasks (Pose Landmarker)** to support **figure skating pose visualization and jump analysis** in real time.
+Skating Pose is an Android demo app built on **Google AI Edge / MediaPipe Tasks (Pose Landmarker)** to support **figure skating pose visualization and jump analysis**.
 
-It uses the device camera to detect human body keypoints, draws a colorized skeleton overlay, and computes simple metrics about **jumps** (height, airtime, rotation). The app is intended as an experimental tool, *not* as an official ISU judging system.
+It uses the device camera to detect human body keypoints, draws a colorized skeleton overlay, and records pose keypoints while you capture. After you stop, it runs jump analysis (height, airtime, rotation, type) and shows a result screen. The app is intended as an experimental tool, *not* as an official ISU judging system.
 
 The current implementation focuses on:
 
 - Real‑time pose keypoint detection on device
 - Skeleton visualization with iOS‑style colors
-- Basic jump detection and ISU‑style jump code display (e.g. `2A`, `3T`, `3Lz`)
+- Recording pose keypoints during capture and **offline jump analysis** once you stop
+- A jump result screen with ISU‑style jump codes (e.g. `2A`, `3T`, `3Lz`)
 - A scrollable information panel showing recent jump events
 
 > Note: **Spin (rotation) detection code has been removed** in order to optimize per‑frame inference time. The app currently only analyzes jumps.
@@ -32,10 +33,11 @@ The current implementation focuses on:
   - Different body parts are rendered with different colors (head, torso, arms, legs).
   - Line width and style are tuned for a clear but not too thick display.
 
-- **iOS-style UI and FPS display**
+- **iOS-style UI, modes and FPS display**
   - Main preview card with rounded corners and light iOS-like color palette.
   - Top-right corner shows smoothed **FPS** using Gemini-style yellow text.
-  - Bottom button toggles **Start / Stop** live pose capture.
+  - Bottom center has an iOS-style record button that toggles **Start / Stop** capture.
+  - Top tabs let you switch between **Jump** and **Spin** modes.
 
 - **Keypoint information panel**
   - Middle area is a scrollable info panel showing per-frame and per-jump statistics.
@@ -49,7 +51,7 @@ The current implementation focuses on:
       - **T** – torso center (average of left/right hip)
       - **A** – ankle center (average of left/right ankle)
 
-- **Jump detection and metrics**
+- **Jump detection and metrics (offline after capture)**
   - Detects airtime based on ankle height relative to an estimated ground level.
   - Estimates jump height (cm) by:
     - Using the normalized distance between nose and ankle as a proxy for body height.
@@ -78,7 +80,7 @@ The current implementation focuses on:
     - Knee bending and extension symmetry
 
 - **Recent jump list (English)**
-  - The info panel shows up to **3 most recent jumps** in reverse chronological order:
+  - After analysis, the result screen and info panel show recent jumps in reverse chronological order:
     - Example line:
       - `t=123456ms 3Lz height=35.2cm airtime=620ms rotation=1040.0deg (2.89 turns)`
   - This makes it easier to review the latest attempts without pausing the camera.
@@ -134,6 +136,7 @@ Possible future improvements:
 - Learn thresholds and jump patterns from labeled training data.
 - Calibrate body height per skater to improve absolute height estimation.
 - Re-introduce spin detection with a more lightweight algorithm, once jump detection is stable.
+- Re-enable on-device video recording for all devices; currently some devices only support skeleton preview and offline analysis without saving MP4 files.
 
 ---
 
@@ -145,7 +148,7 @@ Possible future improvements:
    - A device or emulator with camera access (physical device strongly recommended).
 3. Sync Gradle and build the project.
 4. Run the `app` module on an Android device.
-5. Grant camera permission and tap **Start** to begin live pose capture.
+5. Grant camera permission and tap the **record button** to begin live pose capture. After you stop, the app runs jump analysis and shows a result screen.
 
 ---
 
@@ -156,14 +159,15 @@ Possible future improvements:
 
 **Skating Pose** 是一个基于 **Google AI Edge / MediaPipe Tasks（姿势地标 Pose Landmarker）** 的 Android 演示应用，用于 **花样滑冰动作检测与关键点可视化**。
 
-应用通过手机摄像头实时识别人类身体关键点，在画面上叠加彩色骨架，并对 **跳跃动作** 进行简单分析（高度、腾空时间、旋转圈数和大致类型）。  
+应用通过手机摄像头实时识别人类身体关键点，在画面上叠加彩色骨架，并在录制过程中持续记录关键点与时间戳。在你停止录制后，应用会离线计算 **跳跃动作** 的高度、腾空时间、旋转圈数和大致类型，并展示结果页面。  
 本项目主要作为 **技术实验与教练辅助工具**，并非任何官方裁判系统。
 
 当前实现的重点包括：
 
 - 基于 MediaPipe 的实时姿态关键点检测
 - iOS 风格配色的人体骨架可视化
-- 跳跃动作的基础识别与 ISU 风格缩写展示（如 `2A`、`3T`、`3Lz`）
+- 录制过程中记录关键点数据，录制结束后进行 **离线跳跃分析**
+- 结果页面展示 ISU 风格的跳跃缩写（如 `2A`、`3T`、`3Lz`）
 - 可滚动的信息栏，展示最近几次跳跃的详细数据
 
 > 说明：为了优化每帧推理时间，当前版本已 **移除旋转（旋转步/旋转姿势）的检测代码**，只保留跳跃分析。
@@ -181,10 +185,11 @@ Possible future improvements:
   - 不同身体部位（头部、躯干、手臂、腿部）使用不同颜色显示。
   - 线宽做了适中调整，既突出骨架又不会遮挡太多画面。
 
-- **iOS 风格 UI + FPS 显示**
+- **iOS 风格 UI + 模式切换 + FPS 显示**
   - 顶部为带圆角的预览卡片，整体颜色偏向 iOS 风格的浅色系。
   - 右上角显示平滑后的 **FPS**，采用类似 Gemini 风格的黄色字体。
-  - 底部按钮用于 **开始 / 停止** 实时姿态分析。
+  - 底部中间为 iOS 风格录制按钮，用于 **开始 / 停止** 捕捉。
+  - 顶部标签可在 **Jump** 与 **Spin** 模式之间切换。
 
 - **关键点信息栏**
   - 中部信息区域为可滚动的文本，展示帧级与跳跃级的数据。
@@ -198,7 +203,7 @@ Possible future improvements:
       - **T**：躯干中心（左右髋关节的平均）
       - **A**：脚踝中心（左右脚踝的平均）
 
-- **跳跃检测与指标**
+- **跳跃检测与指标（录制结束后的离线计算）**
   - 根据脚踝相对“地面”的高度变化来判断是否腾空。
   - 使用鼻子到脚踝的归一化距离估计身体高度，假定固定身高（例如 160 cm），换算出跳跃高度（厘米）。
   - 在腾空期间，跟踪髋部的旋转角度，计算：
@@ -289,5 +294,4 @@ Possible future improvements:
    - 可用的 Android 设备或模拟器（推荐真机，带摄像头）
 3. 同步 Gradle 并编译项目。
 4. 运行 `app` 模块到 Android 设备上。
-5. 授予摄像头权限，点击 **开始捕捉** 按钮，即可看到实时骨架与跳跃分析信息。
-
+5. 授予摄像头权限，点击底部的 **录制按钮** 开始捕捉；停止后，应用会自动进行跳跃分析并展示结果页面。
