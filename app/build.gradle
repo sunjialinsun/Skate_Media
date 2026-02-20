@@ -86,6 +86,9 @@ dependencies {
     // CameraX View class
     implementation "androidx.camera:camera-view:$camerax_version"
 
+    // CameraX Video capture
+    implementation "androidx.camera:camera-video:$camerax_version"
+
     // WindowManager
     implementation 'androidx.window:window:1.1.0-alpha03'
 

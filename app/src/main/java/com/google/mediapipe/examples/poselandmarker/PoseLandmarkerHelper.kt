@@ -47,6 +47,7 @@ class PoseLandmarkerHelper(
     // For this example this needs to be a var so it can be reset on changes.
     // If the Pose Landmarker will not change, a lazy val would be preferable.
     private var poseLandmarker: PoseLandmarker? = null
+    private var bitmapBuffer: Bitmap? = null
 
     init {
         setupPoseLandmarker()
@@ -162,15 +163,21 @@ class PoseLandmarkerHelper(
         }
         val frameTime = SystemClock.uptimeMillis()
 
-        // Copy out RGB bits from the frame to a bitmap buffer
-        val bitmapBuffer =
-            Bitmap.createBitmap(
-                imageProxy.width,
-                imageProxy.height,
-                Bitmap.Config.ARGB_8888
-            )
+        if (bitmapBuffer == null ||
+            bitmapBuffer?.width != imageProxy.width ||
+            bitmapBuffer?.height != imageProxy.height
+        ) {
+            bitmapBuffer =
+                Bitmap.createBitmap(
+                    imageProxy.width,
+                    imageProxy.height,
+                    Bitmap.Config.ARGB_8888
+                )
+        }
 
-        imageProxy.use { bitmapBuffer.copyPixelsFromBuffer(imageProxy.planes[0].buffer) }
+        val buffer = bitmapBuffer!!
+
+        imageProxy.use { buffer.copyPixelsFromBuffer(imageProxy.planes[0].buffer) }
         imageProxy.close()
 
         val matrix = Matrix().apply {
@@ -188,7 +195,7 @@ class PoseLandmarkerHelper(
             }
         }
         val rotatedBitmap = Bitmap.createBitmap(
-            bitmapBuffer, 0, 0, bitmapBuffer.width, bitmapBuffer.height,
+            buffer, 0, 0, buffer.width, buffer.height,
             matrix, true
         )
 

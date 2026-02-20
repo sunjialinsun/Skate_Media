@@ -47,6 +47,22 @@
                 android:name="android.notch_support"
                 android:value="true" />
         </activity>
+
+        <activity
+            android:name=".GalleryActivity"
+            android:exported="false" />
+
+        <activity
+            android:name=".Skeleton3DActivity"
+            android:exported="false" />
+
+        <activity
+            android:name=".AdvancedDataActivity"
+            android:exported="false" />
+
+        <activity
+            android:name=".JumpResultActivity"
+            android:exported="false" />
     </application>
 
 </manifest>

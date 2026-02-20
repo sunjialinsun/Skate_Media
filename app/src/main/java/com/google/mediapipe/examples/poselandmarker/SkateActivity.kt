@@ -1,20 +1,38 @@
 package com.google.mediapipe.examples.poselandmarker
 
 import android.Manifest
+import android.content.ContentValues
+import android.content.Intent
 import android.content.pm.PackageManager
+import android.os.Build
 import android.os.Bundle
+import android.provider.MediaStore
+import android.view.ScaleGestureDetector
 import android.view.View
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
+import androidx.appcompat.app.AlertDialog
 import androidx.camera.core.AspectRatio
+import androidx.camera.core.Camera
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.ImageProxy
 import androidx.camera.core.Preview
 import androidx.camera.lifecycle.ProcessCameraProvider
+import androidx.camera.video.MediaStoreOutputOptions
+import androidx.camera.video.PendingRecording
+import androidx.camera.video.Quality
+import androidx.camera.video.QualitySelector
+import androidx.camera.video.Recorder
+import androidx.camera.video.Recording
+import androidx.camera.video.VideoCapture
+import androidx.camera.video.VideoRecordEvent
 import androidx.core.content.ContextCompat
+import androidx.camera.view.PreviewView
 import com.google.mediapipe.examples.poselandmarker.databinding.ActivitySkateBinding
 import com.google.mediapipe.tasks.vision.core.RunningMode
+import org.json.JSONArray
+import org.json.JSONObject
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import kotlin.math.abs
@@ -27,6 +45,11 @@ class SkateActivity : AppCompatActivity(), PoseLandmarkerHelper.LandmarkerListen
     private lateinit var cameraExecutor: ExecutorService
     private var cameraProvider: ProcessCameraProvider? = null
     private var imageAnalyzer: ImageAnalysis? = null
+    private var camera: Camera? = null
+    private var videoCapture: VideoCapture<Recorder>? = null
+    private var activeRecording: Recording? = null
+    private var isRecordingVideo: Boolean = false
+    private var currentVideoUri: String? = null
     private var running = false
 
     private lateinit var poseLandmarkerHelper: PoseLandmarkerHelper
@@ -44,10 +67,27 @@ class SkateActivity : AppCompatActivity(), PoseLandmarkerHelper.LandmarkerListen
     private var jumpStartHipX: Float = 0f
     private var jumpStartHipY: Float = 0f
     private val jumpEvents = mutableListOf<JumpEvent>()
+    private val recordedFrames = mutableListOf<FrameFeature>()
 
     private val assumedBodyHeightCm = 160.0
     private val frameWindow = ArrayDeque<FrameFeature>()
     private val windowSize = 5
+
+    private val toePickRangeThreshold = 0.06f
+    private val hipOverFootThreshold = 0.03f
+    private val kneeBentAngle = 140.0
+    private val kneeBentAngleTakeoff = 120.0
+    private val kneeExtendedAngle = 150.0
+    private val edgeOffsetSmall = 0.02f
+    private val edgeOffsetMedium = 0.05f
+    private val edgeOffsetLarge = 0.1f
+    private val ankleSeparationLarge = 0.15f
+    private val torsoTiltSmall = 0.05f
+    private val torsoTiltLarge = 0.1f
+    private val jumpTakeoffThreshold = 0.05f
+    private val jumpLandingThreshold = 0.02f
+
+    private var currentMode: CaptureMode = CaptureMode.JUMP
 
     private val cameraPermissionLauncher =
         registerForActivityResult(
@@ -56,8 +96,6 @@ class SkateActivity : AppCompatActivity(), PoseLandmarkerHelper.LandmarkerListen
             if (granted) {
                 initPoseLandmarker()
                 startCamera()
-            } else {
-                binding.tvPoseInfo.text = "未授予摄像头权限"
             }
         }
 
@@ -68,13 +106,81 @@ class SkateActivity : AppCompatActivity(), PoseLandmarkerHelper.LandmarkerListen
 
         cameraExecutor = Executors.newSingleThreadExecutor()
 
-        binding.btnStart.setOnClickListener {
-            if (!running) {
-                requestCameraAndStart()
+        binding.viewFinder.implementationMode = PreviewView.ImplementationMode.PERFORMANCE
+        binding.viewFinder.scaleType = PreviewView.ScaleType.FILL_START
+
+        binding.navRecord.setOnClickListener {
+            binding.navRecordLabel.setTextColor(
+                ContextCompat.getColor(this, R.color.ios_text_primary)
+            )
+            binding.navJumpsLabel.setTextColor(
+                ContextCompat.getColor(this, R.color.ios_text_secondary)
+            )
+        }
+
+        binding.navJumps.setOnClickListener {
+            binding.navRecordLabel.setTextColor(
+                ContextCompat.getColor(this, R.color.ios_text_secondary)
+            )
+            binding.navJumpsLabel.setTextColor(
+                ContextCompat.getColor(this, R.color.ios_text_primary)
+            )
+            val intent = Intent(this, GalleryActivity::class.java)
+            intent.putExtra("mode", currentMode.name)
+            startActivity(intent)
+        }
+
+        binding.tabJump.setOnClickListener {
+            currentMode = CaptureMode.JUMP
+            binding.tabJump.setBackgroundResource(R.drawable.bg_toggle_mode_selected)
+            binding.tabSpin.setBackgroundResource(0)
+            binding.navJumpsLabel.text = "Jumps"
+        }
+
+        binding.tabSpin.setOnClickListener {
+            currentMode = CaptureMode.SPIN
+            binding.tabSpin.setBackgroundResource(R.drawable.bg_toggle_mode_selected)
+            binding.tabJump.setBackgroundResource(0)
+            binding.navJumpsLabel.text = "Spins"
+        }
+
+        binding.btnRecord.setOnClickListener {
+            if (!isRecordingVideo) {
+                isRecordingVideo = true
+                updateRecordButton()
+                startRecording()
             } else {
-                stopAnalysis()
+                stopRecording()
+                isRecordingVideo = false
+                updateRecordButton()
             }
         }
+
+        val scaleGestureDetector = ScaleGestureDetector(
+            this,
+            object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
+                override fun onScale(detector: ScaleGestureDetector): Boolean {
+                    val cameraLocal = camera ?: return false
+                    val zoomState = cameraLocal.cameraInfo.zoomState.value ?: return false
+                    val currentZoom = zoomState.zoomRatio
+                    val minZoom = zoomState.minZoomRatio
+                    val maxZoom = zoomState.maxZoomRatio
+                    val scale = detector.scaleFactor
+                    val newZoom = (currentZoom * scale).coerceIn(minZoom, maxZoom)
+                    cameraLocal.cameraControl.setZoomRatio(newZoom)
+                    return true
+                }
+            }
+        )
+        binding.viewFinder.setOnTouchListener { _, event ->
+            scaleGestureDetector.onTouchEvent(event)
+            true
+        }
+
+        binding.tabJump.performClick()
+        binding.navRecord.performClick()
+        updateRecordButton()
+        requestCameraAndStart()
     }
 
     private fun requestCameraAndStart() {
@@ -93,6 +199,7 @@ class SkateActivity : AppCompatActivity(), PoseLandmarkerHelper.LandmarkerListen
     private fun initPoseLandmarker() {
         poseLandmarkerHelper = PoseLandmarkerHelper(
             context = this,
+            currentModel = PoseLandmarkerHelper.MODEL_POSE_LANDMARKER_LITE,
             runningMode = RunningMode.LIVE_STREAM,
             poseLandmarkerHelperListener = this
         )
@@ -105,7 +212,6 @@ class SkateActivity : AppCompatActivity(), PoseLandmarkerHelper.LandmarkerListen
                 cameraProvider = cameraProviderFuture.get()
                 bindUseCases()
                 running = true
-                binding.btnStart.text = "停止捕捉"
             },
             ContextCompat.getMainExecutor(this)
         )
@@ -115,14 +221,18 @@ class SkateActivity : AppCompatActivity(), PoseLandmarkerHelper.LandmarkerListen
         val provider = cameraProvider ?: return
         provider.unbindAll()
 
+        videoCapture = null
+
+        val rotation = binding.viewFinder.display.rotation
+
         val preview = Preview.Builder()
-            .setTargetAspectRatio(AspectRatio.RATIO_16_9)
+            .setTargetAspectRatio(AspectRatio.RATIO_4_3)
+            .setTargetRotation(rotation)
             .build()
-            .also {
-                it.setSurfaceProvider(binding.viewFinder.surfaceProvider)
-            }
 
         imageAnalyzer = ImageAnalysis.Builder()
+            .setTargetAspectRatio(AspectRatio.RATIO_4_3)
+            .setTargetRotation(rotation)
             .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
             .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
             .build()
@@ -137,12 +247,73 @@ class SkateActivity : AppCompatActivity(), PoseLandmarkerHelper.LandmarkerListen
                 .requireLensFacing(CameraSelector.LENS_FACING_BACK)
                 .build()
 
-        provider.bindToLifecycle(
+        camera = provider.bindToLifecycle(
             this,
             cameraSelector,
             preview,
             imageAnalyzer
         )
+
+        preview.setSurfaceProvider(binding.viewFinder.surfaceProvider)
+    }
+
+    private fun startRecording() {
+        val videoCapture = videoCapture ?: return
+
+        val namePrefix = if (currentMode == CaptureMode.JUMP) "jump_" else "spin_"
+        val name = namePrefix + System.currentTimeMillis()
+
+        val contentValues = ContentValues().apply {
+            put(MediaStore.Video.Media.DISPLAY_NAME, name)
+            put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                put(MediaStore.Video.Media.RELATIVE_PATH, "Movies/SkateMedia")
+            }
+        }
+
+        val collection =
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                MediaStore.Video.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
+            } else {
+                MediaStore.Video.Media.EXTERNAL_CONTENT_URI
+            }
+
+        val outputOptions = MediaStoreOutputOptions.Builder(
+            contentResolver,
+            collection
+        ).setContentValues(contentValues).build()
+
+        activeRecording =
+            videoCapture.output
+                .prepareRecording(this, outputOptions)
+                .start(ContextCompat.getMainExecutor(this)) { event ->
+                    if (event is VideoRecordEvent.Finalize) {
+                        activeRecording = null
+                        currentVideoUri = event.outputResults.outputUri.toString()
+                        updateRecordButton()
+                    }
+                }
+
+        updateRecordButton()
+    }
+
+    private fun stopRecording() {
+        activeRecording?.stop()
+        activeRecording = null
+        updateRecordButton()
+        showJumpAnalysis()
+    }
+
+    private fun updateRecordButton() {
+        if (isRecordingVideo) {
+            val inner = binding.recordInner
+            inner.animate().scaleX(0.7f).scaleY(0.7f).setDuration(150).start()
+            inner.background = ContextCompat.getDrawable(this, R.drawable.bg_record_square)
+        } else {
+            val inner = binding.recordInner
+            inner.animate().scaleX(1f).scaleY(1f).setDuration(150).start()
+            inner.background = ContextCompat.getDrawable(this, R.drawable.bg_record_circle)
+        }
     }
 
     private fun analyzeImage(imageProxy: ImageProxy) {
@@ -160,7 +331,6 @@ class SkateActivity : AppCompatActivity(), PoseLandmarkerHelper.LandmarkerListen
         running = false
         cameraProvider?.unbindAll()
         imageAnalyzer?.clearAnalyzer()
-        binding.btnStart.text = "开始 AI 实时动作捕捉"
         binding.tvFps.text = "FPS 0.0"
         if (this::poseLandmarkerHelper.isInitialized) {
             cameraExecutor.execute { poseLandmarkerHelper.clearPoseLandmarker() }
@@ -176,176 +346,12 @@ class SkateActivity : AppCompatActivity(), PoseLandmarkerHelper.LandmarkerListen
     }
 
     override fun onError(error: String, errorCode: Int) {
-        runOnUiThread {
-            binding.tvPoseInfo.append("\n错误: $error")
-        }
+        runOnUiThread { }
     }
 
     override fun onResults(resultBundle: PoseLandmarkerHelper.ResultBundle) {
         if (resultBundle.results.isEmpty()) return
         val result = resultBundle.results[0]
-        val poseList = result.landmarks()
-        if (poseList.isEmpty()) return
-        val landmarks = poseList[0]
-
-        val timestampMs = result.timestampMs()
-        val leftHipIndex = 23
-        val rightHipIndex = 24
-        if (landmarks.size <= rightHipIndex) return
-        val leftHip = landmarks[leftHipIndex]
-        val rightHip = landmarks[rightHipIndex]
-        val centerX = (leftHip.x() + rightHip.x()) / 2f
-        val centerY = (leftHip.y() + rightHip.y()) / 2f
-
-        val leftKnee = landmarks[25]
-        val rightKnee = landmarks[26]
-        val leftAnkleLandmark = landmarks[27]
-        val rightAnkleLandmark = landmarks[28]
-        val leftShoulder = landmarks[11]
-        val rightShoulder = landmarks[12]
-
-        val frameFeature = FrameFeature(
-            timestampMs = timestampMs,
-            leftHip = Joint(leftHip.x(), leftHip.y()),
-            rightHip = Joint(rightHip.x(), rightHip.y()),
-            leftKnee = Joint(leftKnee.x(), leftKnee.y()),
-            rightKnee = Joint(rightKnee.x(), rightKnee.y()),
-            leftAnkle = Joint(leftAnkleLandmark.x(), leftAnkleLandmark.y()),
-            rightAnkle = Joint(rightAnkleLandmark.x(), rightAnkleLandmark.y()),
-            leftShoulder = Joint(leftShoulder.x(), leftShoulder.y()),
-            rightShoulder = Joint(rightShoulder.x(), rightShoulder.y())
-        )
-        if (frameWindow.size >= windowSize) {
-            frameWindow.removeFirst()
-        }
-        frameWindow.addLast(frameFeature)
-
-        val rawAngleDeg = Math.toDegrees(
-            atan2(
-                (rightHip.y() - leftHip.y()).toDouble(),
-                (rightHip.x() - leftHip.x()).toDouble()
-            )
-        )
-
-        val previousAngle = lastAngleDeg
-        val previousTimestamp = lastTimestampMs
-        var deltaAngleDeg = 0.0
-        var angularVelocityTurnsPerSec = 0.0
-        if (previousAngle != null && previousTimestamp != null) {
-            var delta = rawAngleDeg - previousAngle
-            if (delta > 180.0) delta -= 360.0
-            if (delta < -180.0) delta += 360.0
-            angleUnwrappedDeg += delta
-            deltaAngleDeg = delta
-            val dtMs = timestampMs - previousTimestamp
-            if (dtMs > 0) {
-                val dtSec = dtMs.toDouble() / 1000.0
-                angularVelocityTurnsPerSec = abs(deltaAngleDeg) / 360.0 / dtSec
-            }
-        }
-        lastAngleDeg = rawAngleDeg
-        lastTimestampMs = timestampMs
-
-        val leftAnkleIndex = 27
-        val rightAnkleIndex = 28
-        var ankleY = centerY
-        if (landmarks.size > rightAnkleIndex) {
-            val leftAnkle = landmarks[leftAnkleIndex]
-            val rightAnkle = landmarks[rightAnkleIndex]
-            ankleY = (leftAnkle.y() + rightAnkle.y()) / 2f
-        }
-
-        val currentGround = groundAnkleY
-        if (currentGround == null) {
-            groundAnkleY = ankleY
-        } else if (!inAir) {
-            groundAnkleY = currentGround * 0.9f + ankleY * 0.1f
-        }
-
-        val ground = groundAnkleY ?: ankleY
-        val heightRel = ground - ankleY
-        val isCurrentlyAir = heightRel > 0.05f
-
-        if (isCurrentlyAir && !inAir) {
-            inAir = true
-            jumpStartTimeMs = timestampMs
-            jumpStartAngleUnwrappedDeg = angleUnwrappedDeg
-            jumpMinAnkleY = ankleY
-            jumpStartHipX = centerX
-            jumpStartHipY = centerY
-        } else if (isCurrentlyAir && inAir) {
-            if (ankleY < jumpMinAnkleY) {
-                jumpMinAnkleY = ankleY
-            }
-        } else if (!isCurrentlyAir && inAir) {
-            val airtimeMs = timestampMs - jumpStartTimeMs
-            val noseIndex = 0
-            var bodySpan = 0.0
-            if (landmarks.size > leftAnkleIndex && landmarks.size > noseIndex) {
-                val nose = landmarks[noseIndex]
-                val landingAnkleY = ankleY
-                bodySpan = abs((nose.y() - landingAnkleY).toDouble())
-            }
-            val scaleCmPerNorm = if (bodySpan > 0.0) assumedBodyHeightCm / bodySpan else 0.0
-            val jumpHeightNorm = ground - jumpMinAnkleY
-            val jumpHeightCm = jumpHeightNorm.toDouble() * scaleCmPerNorm
-            val rotationDeltaDeg = angleUnwrappedDeg - jumpStartAngleUnwrappedDeg
-            val rotationDeg = abs(rotationDeltaDeg)
-            val rotationTurns = rotationDeg / 360.0
-            val absTurns = rotationTurns
-            val dxJump = centerX - jumpStartHipX
-            val dyJump = centerY - jumpStartHipY
-            val jumpMoveDist = kotlin.math.sqrt((dxJump * dxJump + dyJump * dyJump).toDouble())
-            val jumpMoveMax = 0.3
-            val minHeightCm = 8.0
-            val minAirtimeMs = 200L
-            val minTurns = 0.5
-            if (jumpHeightCm < minHeightCm && airtimeMs < minAirtimeMs && absTurns < minTurns) {
-                inAir = false
-                return
-            }
-            val baseLabel =
-                if (airtimeMs < 150 || jumpHeightCm < 5.0) {
-                    "小跳"
-                } else if (absTurns < 0.75) {
-                    "未完成单跳"
-                } else if (absTurns < 1.5) {
-                    "单跳"
-                } else if (absTurns < 2.5) {
-                    "双跳"
-                } else if (absTurns < 3.5) {
-                    "三跳"
-                } else {
-                    "多周跳"
-                }
-            if (jumpMoveDist > jumpMoveMax) {
-                inAir = false
-                return
-            }
-            val jumpType = classifyJumpType()
-            val typeLabel = when (jumpType) {
-                JumpType.TOE_LOOP -> "Toe Loop 后外点冰跳"
-                JumpType.FLIP -> "Flip 后内点冰跳"
-                JumpType.LUTZ -> "Lutz 勾手跳"
-                JumpType.SALCHOW -> "Salchow 后内结环跳"
-                JumpType.LOOP -> "Loop 后外结环跳"
-                JumpType.AXEL -> "Axel 阿克塞尔前外跳"
-                JumpType.UNKNOWN -> "未知跳跃"
-            }
-            val label = "$typeLabel $baseLabel"
-            jumpEvents.add(
-                JumpEvent(
-                    timestampMs = timestampMs,
-                    heightCm = jumpHeightCm,
-                    airtimeMs = airtimeMs,
-                    rotationDeg = rotationDeg,
-                    rotationTurns = rotationTurns,
-                    label = label,
-                    type = jumpType
-                )
-            )
-            inAir = false
-        }
 
         val instantFps =
             if (resultBundle.inferenceTime > 0) 1000.0 / resultBundle.inferenceTime.toDouble()
@@ -353,51 +359,31 @@ class SkateActivity : AppCompatActivity(), PoseLandmarkerHelper.LandmarkerListen
         fpsSmoothed =
             if (fpsSmoothed == 0.0) instantFps else fpsSmoothed * 0.8 + instantFps * 0.2
 
-        val builder = StringBuilder()
-        builder.append("帧推理时间: ${resultBundle.inferenceTime} ms\n")
-        builder.append("关节点数量: ${landmarks.size}\n")
-        builder.append("总旋转圈数: ${"%.2f".format(abs(angleUnwrappedDeg / 360.0))}\n")
-        builder.append("当前旋转速度: ${"%.2f".format(angularVelocityTurnsPerSec)} 转/秒\n")
+        if (isRecordingVideo) {
+            val landmarks = result.landmarks().firstOrNull()
+            if (landmarks != null && landmarks.size > 28) {
+                val timestampMs = System.currentTimeMillis()
+                val leftHip = Joint(landmarks[23].x(), landmarks[23].y())
+                val rightHip = Joint(landmarks[24].x(), landmarks[24].y())
+                val leftKnee = Joint(landmarks[25].x(), landmarks[25].y())
+                val rightKnee = Joint(landmarks[26].x(), landmarks[26].y())
+                val leftAnkle = Joint(landmarks[27].x(), landmarks[27].y())
+                val rightAnkle = Joint(landmarks[28].x(), landmarks[28].y())
+                val leftShoulder = Joint(landmarks[11].x(), landmarks[11].y())
+                val rightShoulder = Joint(landmarks[12].x(), landmarks[12].y())
 
-        if (landmarks.size > 28) {
-            val nose = landmarks[0]
-            val leftHip = landmarks[23]
-            val rightHip = landmarks[24]
-            val leftAnkleLandmark = landmarks[27]
-            val rightAnkleLandmark = landmarks[28]
-            val torsoX = (leftHip.x() + rightHip.x()) / 2f
-            val torsoY = (leftHip.y() + rightHip.y()) / 2f
-            val torsoZ = (leftHip.z() + rightHip.z()) / 2f
-            val ankleX = (leftAnkleLandmark.x() + rightAnkleLandmark.x()) / 2f
-            val ankleY = (leftAnkleLandmark.y() + rightAnkleLandmark.y()) / 2f
-            val ankleZ = (leftAnkleLandmark.z() + rightAnkleLandmark.z()) / 2f
-            builder.append(
-                "H x=${"%.3f".format(nose.x())} y=${"%.3f".format(nose.y())} z=${"%.3f".format(nose.z())}  " +
-                        "T x=${"%.3f".format(torsoX)} y=${"%.3f".format(torsoY)} z=${"%.3f".format(torsoZ)}  " +
-                        "A x=${"%.3f".format(ankleX)} y=${"%.3f".format(ankleY)} z=${"%.3f".format(ankleZ)}\n"
-            )
-        }
-
-        if (jumpEvents.isNotEmpty()) {
-            builder.append("\nRecent jumps:\n")
-            jumpEvents.asReversed().take(3).forEach { jump ->
-                val rev = kotlin.math.round(jump.rotationTurns).toInt().coerceAtLeast(1)
-                val typeCode = when (jump.type) {
-                    JumpType.TOE_LOOP -> "${rev}T"
-                    JumpType.FLIP -> "${rev}F"
-                    JumpType.LUTZ -> "${rev}Lz"
-                    JumpType.SALCHOW -> "${rev}S"
-                    JumpType.LOOP -> "${rev}Lo"
-                    JumpType.AXEL -> "${rev}A"
-                    JumpType.UNKNOWN -> "Jump?"
-                }
-                builder.append(
-                    "t=${jump.timestampMs}ms $typeCode " +
-                            "height=${"%.1f".format(jump.heightCm)}cm " +
-                            "airtime=${jump.airtimeMs}ms " +
-                            "rotation=${"%.1f".format(jump.rotationDeg)}deg " +
-                            "(${String.format("%.2f", jump.rotationTurns)} turns)\n"
+                val frame = FrameFeature(
+                    timestampMs = timestampMs,
+                    leftHip = leftHip,
+                    rightHip = rightHip,
+                    leftKnee = leftKnee,
+                    rightKnee = rightKnee,
+                    leftAnkle = leftAnkle,
+                    rightAnkle = rightAnkle,
+                    leftShoulder = leftShoulder,
+                    rightShoulder = rightShoulder
                 )
+                recordedFrames.add(frame)
             }
         }
 
@@ -408,12 +394,297 @@ class SkateActivity : AppCompatActivity(), PoseLandmarkerHelper.LandmarkerListen
                 resultBundle.inputImageWidth,
                 RunningMode.LIVE_STREAM
             )
-            binding.tvPoseInfo.text = builder.toString()
-            binding.scrollInfo.post {
-                binding.scrollInfo.fullScroll(View.FOCUS_DOWN)
-            }
             val text = "FPS ${"%.1f".format(fpsSmoothed)}"
             binding.tvFps.text = text
+        }
+    }
+
+    private fun processJumpFrame(resultBundle: PoseLandmarkerHelper.ResultBundle) {
+        val result = resultBundle.results[0]
+        val landmarks = result.landmarks().firstOrNull() ?: return
+        if (landmarks.size <= 28) return
+
+        val timestampMs = System.currentTimeMillis()
+
+        val leftHip = Joint(landmarks[23].x(), landmarks[23].y())
+        val rightHip = Joint(landmarks[24].x(), landmarks[24].y())
+        val leftKnee = Joint(landmarks[25].x(), landmarks[25].y())
+        val rightKnee = Joint(landmarks[26].x(), landmarks[26].y())
+        val leftAnkle = Joint(landmarks[27].x(), landmarks[27].y())
+        val rightAnkle = Joint(landmarks[28].x(), landmarks[28].y())
+        val leftShoulder = Joint(landmarks[11].x(), landmarks[11].y())
+        val rightShoulder = Joint(landmarks[12].x(), landmarks[12].y())
+
+        val frame = FrameFeature(
+            timestampMs = timestampMs,
+            leftHip = leftHip,
+            rightHip = rightHip,
+            leftKnee = leftKnee,
+            rightKnee = rightKnee,
+            leftAnkle = leftAnkle,
+            rightAnkle = rightAnkle,
+            leftShoulder = leftShoulder,
+            rightShoulder = rightShoulder
+        )
+
+        frameWindow.addLast(frame)
+        if (frameWindow.size > windowSize) {
+            frameWindow.removeFirst()
+        }
+
+        val hipCenter = frame.hipCenter()
+        val shoulderCenter = frame.shoulderCenter()
+        val dx = shoulderCenter.x - hipCenter.x
+        val dy = shoulderCenter.y - hipCenter.y
+        val angleRad = atan2(dy.toDouble(), dx.toDouble())
+        val angleDeg = Math.toDegrees(angleRad)
+
+        val lastAngle = lastAngleDeg
+        if (lastAngle != null) {
+            var delta = angleDeg - lastAngle
+            if (delta > 180) delta -= 360.0
+            if (delta < -180) delta += 360.0
+            angleUnwrappedDeg += delta
+        }
+        lastAngleDeg = angleDeg
+
+        val minAnkleY = minOf(leftAnkle.y, rightAnkle.y)
+        if (groundAnkleY == null) {
+            groundAnkleY = minAnkleY
+        }
+        val ground = groundAnkleY!!
+
+        if (!inAir) {
+            groundAnkleY = ground * 0.9f + minAnkleY * 0.1f
+            if (ground - minAnkleY > jumpTakeoffThreshold) {
+                inAir = true
+                jumpStartTimeMs = timestampMs
+                jumpStartAngleUnwrappedDeg = angleUnwrappedDeg
+                jumpMinAnkleY = minAnkleY
+                jumpStartHipX = hipCenter.x
+                jumpStartHipY = hipCenter.y
+            }
+        } else {
+            if (minAnkleY < jumpMinAnkleY) {
+                jumpMinAnkleY = minAnkleY
+            }
+            if (ground - minAnkleY < jumpLandingThreshold) {
+                val airtimeMs = timestampMs - jumpStartTimeMs
+                val verticalNorm = ground - jumpMinAnkleY
+                val heightCm = (verticalNorm * assumedBodyHeightCm).coerceAtLeast(0.0)
+                val rotationDeg = angleUnwrappedDeg - jumpStartAngleUnwrappedDeg
+                val rotationTurns = rotationDeg / 360.0
+                val type = classifyJumpType()
+                val label = when (type) {
+                    JumpType.AXEL -> "Axel"
+                    JumpType.SALCHOW -> "Salchow"
+                    JumpType.LOOP -> "Loop"
+                    JumpType.FLIP -> "Flip"
+                    JumpType.LUTZ -> "Lutz"
+                    JumpType.TOE_LOOP -> "Toe loop"
+                    JumpType.UNKNOWN -> "Unknown"
+                }
+                jumpEvents.add(
+                    JumpEvent(
+                        timestampMs = timestampMs,
+                        heightCm = heightCm,
+                        airtimeMs = airtimeMs,
+                        rotationDeg = rotationDeg,
+                        rotationTurns = rotationTurns,
+                        label = label,
+                        type = type
+                    )
+                )
+                inAir = false
+            }
+        }
+    }
+
+    private fun showJumpAnalysis() {
+        if (recordedFrames.isEmpty()) {
+            AlertDialog.Builder(this)
+                .setTitle("跳跃分析")
+                .setMessage("本次录制未采集到骨架数据。")
+                .setPositiveButton("确定", null)
+                .show()
+            return
+        }
+
+        val progressDialog = AlertDialog.Builder(this)
+            .setTitle("跳跃分析")
+            .setMessage("分析进行中...")
+            .setCancelable(false)
+            .create()
+        progressDialog.show()
+
+        val sessionId = System.currentTimeMillis()
+
+        cameraExecutor.execute {
+            val events = analyzeRecordedFrames()
+            saveRecordedFramesToFile(sessionId)
+
+            runOnUiThread {
+                progressDialog.dismiss()
+
+                if (events.isEmpty()) {
+                    AlertDialog.Builder(this)
+                        .setTitle("跳跃分析")
+                        .setMessage("本次录制未检测到有效跳跃。")
+                        .setPositiveButton("确定", null)
+                        .show()
+                } else {
+                    val results = events.map {
+                        JumpResult(
+                            heightCm = it.heightCm,
+                            airtimeMs = it.airtimeMs,
+                            rotationTurns = it.rotationTurns,
+                            type = it.type.name,
+                            label = it.label
+                        )
+                    }
+                    val session = JumpSession(
+                        id = sessionId,
+                        videoUri = currentVideoUri,
+                        mode = currentMode.name,
+                        createdAt = System.currentTimeMillis(),
+                        results = results
+                    )
+                    JumpSessionStore.addSession(this, session)
+
+                    val intent = Intent(this, JumpResultActivity::class.java)
+                    intent.putExtra("session_id", sessionId)
+                    startActivity(intent)
+                }
+
+                recordedFrames.clear()
+                jumpEvents.clear()
+                frameWindow.clear()
+                inAir = false
+                groundAnkleY = null
+                lastAngleDeg = null
+                angleUnwrappedDeg = 0.0
+            }
+        }
+    }
+
+    private enum class CaptureMode {
+        JUMP,
+        SPIN
+    }
+
+    private fun analyzeRecordedFrames(): List<JumpEvent> {
+        jumpEvents.clear()
+        frameWindow.clear()
+        inAir = false
+        groundAnkleY = null
+        lastAngleDeg = null
+        angleUnwrappedDeg = 0.0
+
+        recordedFrames.forEach { frame ->
+            frameWindow.addLast(frame)
+            if (frameWindow.size > windowSize) {
+                frameWindow.removeFirst()
+            }
+
+            val hipCenter = frame.hipCenter()
+            val shoulderCenter = frame.shoulderCenter()
+            val dx = shoulderCenter.x - hipCenter.x
+            val dy = shoulderCenter.y - hipCenter.y
+            val angleRad = atan2(dy.toDouble(), dx.toDouble())
+            val angleDeg = Math.toDegrees(angleRad)
+
+            val lastAngle = lastAngleDeg
+            if (lastAngle != null) {
+                var delta = angleDeg - lastAngle
+                if (delta > 180) delta -= 360.0
+                if (delta < -180) delta += 360.0
+                angleUnwrappedDeg += delta
+            }
+            lastAngleDeg = angleDeg
+
+            val leftAnkle = frame.leftAnkle
+            val rightAnkle = frame.rightAnkle
+            val minAnkleY = minOf(leftAnkle.y, rightAnkle.y)
+            if (groundAnkleY == null) {
+                groundAnkleY = minAnkleY
+            }
+            val ground = groundAnkleY!!
+
+            if (!inAir) {
+                groundAnkleY = ground * 0.9f + minAnkleY * 0.1f
+                if (ground - minAnkleY > jumpTakeoffThreshold) {
+                    inAir = true
+                    jumpStartTimeMs = frame.timestampMs
+                    jumpStartAngleUnwrappedDeg = angleUnwrappedDeg
+                    jumpMinAnkleY = minAnkleY
+                    jumpStartHipX = hipCenter.x
+                    jumpStartHipY = hipCenter.y
+                }
+            } else {
+                if (minAnkleY < jumpMinAnkleY) {
+                    jumpMinAnkleY = minAnkleY
+                }
+                if (ground - minAnkleY < jumpLandingThreshold) {
+                    val airtimeMs = frame.timestampMs - jumpStartTimeMs
+                    val verticalNorm = ground - jumpMinAnkleY
+                    val heightCm = (verticalNorm * assumedBodyHeightCm).coerceAtLeast(0.0)
+                    val rotationDeg = angleUnwrappedDeg - jumpStartAngleUnwrappedDeg
+                    val rotationTurns = rotationDeg / 360.0
+                    val type = classifyJumpType()
+                    val label = when (type) {
+                        JumpType.AXEL -> "Axel"
+                        JumpType.SALCHOW -> "Salchow"
+                        JumpType.LOOP -> "Loop"
+                        JumpType.FLIP -> "Flip"
+                        JumpType.LUTZ -> "Lutz"
+                        JumpType.TOE_LOOP -> "Toe loop"
+                        JumpType.UNKNOWN -> "Unknown"
+                    }
+                    jumpEvents.add(
+                        JumpEvent(
+                            timestampMs = frame.timestampMs,
+                            heightCm = heightCm,
+                            airtimeMs = airtimeMs,
+                            rotationDeg = rotationDeg,
+                            rotationTurns = rotationTurns,
+                            label = label,
+                            type = type
+                        )
+                    )
+                    inAir = false
+                }
+            }
+        }
+
+        return jumpEvents.toList()
+    }
+
+    private fun saveRecordedFramesToFile(sessionId: Long) {
+        val array = JSONArray()
+        recordedFrames.forEach { frame ->
+            val obj = JSONObject()
+            obj.put("timestampMs", frame.timestampMs)
+            obj.put("leftHipX", frame.leftHip.x)
+            obj.put("leftHipY", frame.leftHip.y)
+            obj.put("rightHipX", frame.rightHip.x)
+            obj.put("rightHipY", frame.rightHip.y)
+            obj.put("leftKneeX", frame.leftKnee.x)
+            obj.put("leftKneeY", frame.leftKnee.y)
+            obj.put("rightKneeX", frame.rightKnee.x)
+            obj.put("rightKneeY", frame.rightKnee.y)
+            obj.put("leftAnkleX", frame.leftAnkle.x)
+            obj.put("leftAnkleY", frame.leftAnkle.y)
+            obj.put("rightAnkleX", frame.rightAnkle.x)
+            obj.put("rightAnkleY", frame.rightAnkle.y)
+            obj.put("leftShoulderX", frame.leftShoulder.x)
+            obj.put("leftShoulderY", frame.leftShoulder.y)
+            obj.put("rightShoulderX", frame.rightShoulder.x)
+            obj.put("rightShoulderY", frame.rightShoulder.y)
+            array.put(obj)
+        }
+        val fileName = "pose_$sessionId.json"
+        openFileOutput(fileName, MODE_PRIVATE).use { out ->
+            out.write(array.toString().toByteArray())
         }
     }
 
@@ -440,33 +711,35 @@ class SkateActivity : AppCompatActivity(), PoseLandmarkerHelper.LandmarkerListen
         val rightAnkleYs = frames.map { it.rightAnkle.y }
         val leftAnkleRange = leftAnkleYs.maxOrNull()!! - leftAnkleYs.minOrNull()!!
         val rightAnkleRange = rightAnkleYs.maxOrNull()!! - rightAnkleYs.minOrNull()!!
-        val hasToePickLeft = leftAnkleRange > 0.06f
-        val hasToePickRight = rightAnkleRange > 0.06f
+        val hasToePickLeft = leftAnkleRange > toePickRangeThreshold
+        val hasToePickRight = rightAnkleRange > toePickRangeThreshold
         val hasToePick = hasToePickLeft || hasToePickRight
-        val hipOverLeftFoot = abs(first.hipCenter().x - first.leftAnkle.x) < 0.03f
-        val hipOverRightFoot = abs(first.hipCenter().x - first.rightAnkle.x) < 0.03f
+        val hipOverLeftFoot = abs(first.hipCenter().x - first.leftAnkle.x) < hipOverFootThreshold
+        val hipOverRightFoot = abs(first.hipCenter().x - first.rightAnkle.x) < hipOverFootThreshold
         val bothKneesBentFirst =
-            rightKneeAngleFirst < 140.0 && leftKneeAngleFirst < 140.0 && abs(rightKneeAngleFirst - leftKneeAngleFirst) < 10.0
-        val rightKneeExtends = rightKneeAngleLast > max(rightKneeAngleFirst, 150.0)
-        val leftKneeExtends = leftKneeAngleLast > max(leftKneeAngleFirst, 150.0)
+            rightKneeAngleFirst < kneeBentAngle && leftKneeAngleFirst < kneeBentAngle && abs(
+                rightKneeAngleFirst - leftKneeAngleFirst
+            ) < 10.0
+        val rightKneeExtends = rightKneeAngleLast > max(rightKneeAngleFirst, kneeExtendedAngle)
+        val leftKneeExtends = leftKneeAngleLast > max(leftKneeAngleFirst, kneeExtendedAngle)
         val rightAnkleForwardThenUp =
             first.rightAnkle.y > last.rightAnkle.y && dyHip < 0f
         val leftAnkleForwardThenUp =
             first.leftAnkle.y > last.leftAnkle.y && dyHip < 0f
 
         if (!hasToePick) {
-            if (isForward && leftEdgeOffset > 0.05f && leftKneeAngleFirst < 120.0 && leftKneeExtends &&
+            if (isForward && leftEdgeOffset > edgeOffsetMedium && leftKneeAngleFirst < kneeBentAngleTakeoff && leftKneeExtends &&
                 shoulderCenterFirst.y < hipCenterFirst.y && (leftAnkleForwardThenUp || rightAnkleForwardThenUp)
             ) {
                 return JumpType.AXEL
             }
-            if (isBackward && leftEdgeOffset < -0.02f && leftKneeAngleFirst < 120.0 && leftKneeExtends &&
+            if (isBackward && leftEdgeOffset < -edgeOffsetSmall && leftKneeAngleFirst < kneeBentAngleTakeoff && leftKneeExtends &&
                 hipOverLeftFoot
             ) {
                 return JumpType.SALCHOW
             }
-            if (isBackward && rightEdgeOffset > 0.02f && bothKneesBentFirst && rightKneeExtends &&
-                abs(rightTorsoTilt) < 0.05f && abs(leftTorsoTilt) < 0.05f
+            if (isBackward && rightEdgeOffset > edgeOffsetSmall && bothKneesBentFirst && rightKneeExtends &&
+                abs(rightTorsoTilt) < torsoTiltSmall && abs(leftTorsoTilt) < torsoTiltSmall
             ) {
                 return JumpType.LOOP
             }
@@ -476,16 +749,17 @@ class SkateActivity : AppCompatActivity(), PoseLandmarkerHelper.LandmarkerListen
         val toeIsLeft = hasToePickLeft && leftAnkleYs.last() < rightAnkleYs.last()
         val toeIsRight = hasToePickRight && rightAnkleYs.last() < leftAnkleYs.last()
 
-        if (isBackward && rightEdgeOffset > 0.05f && (toeIsLeft || hasToePickLeft)) {
+        if (isBackward && rightEdgeOffset > edgeOffsetMedium && (toeIsLeft || hasToePickLeft)) {
             val ankleXDiff = abs(last.leftAnkle.x - last.rightAnkle.x)
-            val torsoTiltLarge = abs(rightTorsoTilt) > 0.1f || abs(leftTorsoTilt) > 0.1f
-            if (rightEdgeOffset > 0.1f && ankleXDiff > 0.15f && torsoTiltLarge) {
+            val torsoTiltLargeValue =
+                abs(rightTorsoTilt) > torsoTiltLarge || abs(leftTorsoTilt) > torsoTiltLarge
+            if (rightEdgeOffset > edgeOffsetLarge && ankleXDiff > ankleSeparationLarge && torsoTiltLargeValue) {
                 return JumpType.LUTZ
             }
             return JumpType.TOE_LOOP
         }
 
-        if (isBackward && leftEdgeOffset < -0.05f && (toeIsRight || hasToePickRight)) {
+        if (isBackward && leftEdgeOffset < -edgeOffsetMedium && (toeIsRight || hasToePickRight)) {
             return JumpType.FLIP
         }
 
